@@ -54,6 +54,11 @@ def cli_battery(listen: float = 3.0) -> None:
         attempts = bt.read_battery(d, listen_seconds=listen)
         best = bt.best_result(attempts)
         if best and best.ok:
+            if best.status == "charging":
+                print(f"[充电中] {d.display_name} ({d.vid_pid}) "
+                      f"{d.describe_usage()}  ← {best.source}")
+                print(f"          {best.detail}")
+                continue
             level = f"{best.level}%" if best.level is not None else "未知"
             print(f"[电量 {level}] {d.display_name} ({d.vid_pid}) "
                   f"{d.describe_usage()}  ← {best.source}")
@@ -651,8 +656,12 @@ def build_ui():
                         vals[3] = f"{best.level}%"
                         tree.item(sel[0], values=vals)
             elif best and best.ok:
-                lab_level.configure(text="电压模式")
-                lab_status.configure(text=f"{best.detail}   来源：{best.source}")
+                if best.status == "charging":
+                    lab_level.configure(text="充电中")
+                    lab_status.configure(text=f"{best.detail}   来源：{best.source}")
+                else:
+                    lab_level.configure(text="电压模式")
+                    lab_status.configure(text=f"{best.detail}   来源：{best.source}")
             else:
                 lab_level.configure(text="未知")
                 lab_status.configure(text="这台设备没有提供可读的电量（或需要手动标定）")

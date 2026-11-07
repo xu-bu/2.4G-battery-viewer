@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""我的设备电量 —— 只显示 ATK 鼠标 + DARKRIM 耳机的简洁面板
+"""我的设备电量 —— 只显示 UGREEN 鼠标 + 2.4G 键盘的简洁面板
 
 用法：
     python my_devices.py            打开界面（默认自动刷新）
     python my_devices.py --once     命令行读一次就退出
 
-界面只有两块卡片，各显示一个设备的电量，可自动刷新。
-底层复用 battery.py / darkrim_proto.py 里已经验证过的协议。
+界面只显示实际读到的设备卡片；键盘读不到时自动隐藏。
+底层复用 ugreen_proto.py / aula_proto.py 里已经验证过的协议。
 """
 
 from __future__ import annotations
@@ -21,7 +21,8 @@ from typing import Optional
 
 import hid_win as hw
 import battery as bt
-import darkrim_proto as drp
+import ugreen_proto as ugp
+import aula_proto as ap
 import tray_common as tc
 import win_link
 from hid_win import HidInterface
@@ -39,10 +40,11 @@ class Reading:
     detail: str = ""
     error: str = ""
     extra: str = ""
+    charging: bool = False
 
     @property
     def ok(self) -> bool:
-        return self.level is not None
+        return self.level is not None or self.charging
 
 
 def _find(vid: int, usage_page: int, output_len: int = 0) -> Optional[HidInterface]:
@@ -53,12 +55,12 @@ def _find(vid: int, usage_page: int, output_len: int = 0) -> Optional[HidInterfa
     return None
 
 
-def read_atk() -> Reading:
-    """ATK / VXE 无线鼠标（内置协议 2）。"""
-    r = Reading("ATK 鼠标", "无接收器")
+def _read_atk() -> Reading:
+    """旧的 ATK / VXE 鼠标协议，作为 UGREEN 接收器不在时的兜底。"""
+    r = Reading("无线鼠标", "无接收器")
     iface = _find(0x373B, 0xFF05, 64) or _find(0x373B, 0xFF02)
     if iface is None:
-        r.error = "没找到接收器（请把 2.4G 接收器插上）"
+        r.error = "没找到鼠标接收器（请把 2.4G 接收器插上）"
         return r
     r.subtitle = f"{iface.vid_pid} · {iface.product or '2.4G 接收器'}"
     try:
@@ -78,38 +80,59 @@ def read_atk() -> Reading:
     return r
 
 
-def read_darkrim() -> Reading:
-    """DARKRIM SHADOW 耳机（杰理方案 dongle，逆向协议）。"""
-    r = Reading("DARKRIM 耳机", "未连接")
+def read_mouse() -> Reading:
+    """UGREEN 2.4G 无线鼠标（2B89:0043，厂商接口 0xFFB5）。"""
+    r = Reading("UGREEN 鼠标", "2.4G 接收器")
+    iface = ugp.find_interface()
+    if iface is None:
+        # 兼容旧的 ATK / VXE 接收器
+        return _read_atk()
+    r.subtitle = f"{iface.vid_pid} · {iface.product or 'UGREEN Receiver'}"
     try:
-        info = drp.read_info(timeout=0.35)
+        info = ugp.read_info(iface, timeout=0.4)
     except Exception as e:
         r.error = f"读取出错：{e}"
         return r
     if not info.online:
-        r.error = info.detail or "没找到 dongle"
+        r.error = info.detail or "鼠标没有回复"
         return r
-    r.subtitle = f"3654:6901 · {info.name or 'DARKRIM'}"
-    r.level = info.battery
-    r.status = ""
-    r.detail = "私有 TLV 协议（TLV 0x01 = 电量）"
-    bits = []
-    if info.dongle_firmware:
-        bits.append(f"dongle 固件 {info.dongle_firmware}")
-    if info.headset_firmware:
-        bits.append(f"耳机固件 {info.headset_firmware}")
-    if info.address:
-        bits.append(f"地址 {info.address}")
-    if info.status_code is not None:
-        bits.append(f"状态码 {info.status_code}")
-    r.extra = " · ".join(bits)
-    if r.level is None and not r.error:
-        r.error = "耳机没有上报电量（请确认耳机已开机并连上）"
+    r.level = info.level
+    r.detail = "UGREEN 厂商协议（Report 0xB5 / 命令 0x01）"
+    if info.raw:
+        r.extra = "原始回复：" + info.raw.hex(" ")
+    if r.level is None:
+        r.error = info.detail or "回复里的电量字段无效"
+    return r
+
+
+def read_keyboard() -> Reading:
+    """3554:FA09 2.4G 无线键盘（AULA / MARVO / iLovbee 同方案，Report 0x13 / 命令 0x4A）。"""
+    r = Reading("2.4G 键盘", "3554:FA09")
+    iface = ap.find_interface()
+    if iface is None:
+        r.error = "没找到 2.4G 键盘接收器（3554:FA09，请把接收器插上）"
+        return r
+    r.subtitle = f"{iface.vid_pid} · {iface.product or '2.4G Wireless Receiver'}"
+    try:
+        info = ap.read_info(iface, timeout=0.5)
+    except Exception as e:
+        r.error = f"读取出错：{e}"
+        return r
+    if not info.online:
+        r.error = info.detail or "键盘没有回复"
+        return r
+    r.charging = info.charging
+    r.level = info.level
+    r.detail = "AULA / MARVO 私有协议（Report 0x13 / 命令 0x4A）"
+    if info.raw:
+        r.extra = "原始回复：" + info.raw.hex(" ")
+    if r.level is None and not r.charging:
+        r.error = info.detail or "回复里没有电量"
     return r
 
 
 def read_all() -> list[Reading]:
-    return [read_atk(), read_darkrim()]
+    return [read_mouse(), read_keyboard()]
 
 
 # ==========================================================================
@@ -117,11 +140,14 @@ def read_all() -> list[Reading]:
 # ==========================================================================
 def cli_once() -> None:
     for r in read_all():
-        if r.ok:
+        if r.level is not None:
             print(f"{r.title}: {r.level}%   {r.detail}")
             if r.extra:
                 print(f"    {r.extra}")
-        else:
+        elif r.charging:
+            print(f"{r.title}: 充电中   {r.detail}")
+        elif r.title != "2.4G 键盘":
+            # 键盘读不到就不显示；鼠标始终给一行结果/原因
             print(f"{r.title}: 读取失败 —— {r.error}")
 
 
@@ -182,12 +208,18 @@ class DeviceCard:
 
     def update(self, r: Reading) -> None:
         self.lab_sub.configure(text=r.subtitle)
-        if r.ok:
+        if r.level is not None:
             self.lab_level.configure(text=f"{r.level}%",
                                      foreground=level_color(r.level))
             st = r.status if r.status not in ("未知", "状态未知") else ""
             self.lab_status.configure(text=st)
-            self.bar["value"] = r.level or 0
+            self.bar["value"] = r.level
+            self.lab_detail.configure(text=r.detail)
+            self.lab_extra.configure(text=r.extra)
+        elif r.charging:
+            self.lab_level.configure(text="充电中", foreground="#4f8cff")
+            self.lab_status.configure(text="插线供电")
+            self.bar["value"] = 100
             self.lab_detail.configure(text=r.detail)
             self.lab_extra.configure(text=r.extra)
         else:
@@ -270,10 +302,19 @@ def build_ui():
     body.columnconfigure(1, weight=1, uniform="card")
     body.rowconfigure(0, weight=1)
 
-    card_atk = DeviceCard(body, "ATK 鼠标")
-    card_atk.frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-    card_dr = DeviceCard(body, "DARKRIM 耳机")
-    card_dr.frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+    card_mouse = DeviceCard(body, "UGREEN 鼠标")
+    card_mouse.frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+    card_kb = DeviceCard(body, "2.4G 键盘")
+    card_kb.frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+
+    def set_keyboard_visible(show: bool) -> None:
+        """键盘读不到电量的时候不占位置；读到后再出现。"""
+        if show:
+            card_kb.frame.grid()
+            card_mouse.frame.grid_configure(columnspan=1, padx=(0, 8))
+        else:
+            card_kb.frame.grid_remove()
+            card_mouse.frame.grid_configure(columnspan=2, padx=(0, 0))
 
     foot = ttk.Label(root, text="正在读取…", style="Muted.TLabel", padding=(18, 4))
     foot.pack(fill="x", side="bottom")
@@ -411,11 +452,16 @@ def build_ui():
 
     # ---- 刷新逻辑 ----
     def apply(readings: list[Reading]):
-        card_atk.update(readings[0])
-        card_dr.update(readings[1])
+        keyboard_ok = readings[1].ok
+        set_keyboard_visible(keyboard_ok)
+        card_mouse.update(readings[0])
+        if keyboard_ok:
+            card_kb.update(readings[1])
         ok = sum(1 for r in readings if r.ok)
+        total = 2 if keyboard_ok else 1
         foot.configure(text=f"更新于 {time.strftime('%H:%M:%S')}   "
-                            f"成功读取 {ok}/2 个设备"
+                            f"成功读取 {ok}/{total} 个设备"
+                            + ("" if keyboard_ok else "   （键盘未检测到，已隐藏）")
                             + ("" if state["auto"] else "   （自动刷新已关闭）"))
         state["busy"] = False
         btn.configure(state="normal")
@@ -425,8 +471,8 @@ def build_ui():
             readings = read_all()
         except Exception:
             traceback.print_exc()
-            readings = [Reading("ATK 鼠标", "", error="读取异常"),
-                        Reading("DARKRIM 耳机", "", error="读取异常")]
+            readings = [Reading("UGREEN 鼠标", "", error="读取异常"),
+                        Reading("2.4G 键盘", "", error="读取异常")]
         results.put(("readings", readings))
 
     def refresh():
@@ -434,7 +480,7 @@ def build_ui():
             return
         state["busy"] = True
         btn.configure(state="disabled")
-        foot.configure(text="正在读取…（耳机的协议要几秒钟）")
+        foot.configure(text="正在读取…（键盘休眠时按一下键盘再刷新）")
         threading.Thread(target=worker, daemon=True).start()
 
     def _reschedule():

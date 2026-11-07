@@ -6,11 +6,14 @@ battery.py —— 电量读取核心
 
   A. 标准 HID 电量字段（Usage Page 0x0006 / Usage 0x0020 Battery Strength，
      以及数字化仪页 0x000D/0x003B、电池系统页 0x0085 等）—— 读 Feature Report
-  B. 已收录的厂商协议（Endgame Gear / VAXEE / Nordic nRF ...）
+  B. 已收录的厂商协议（UGREEN / Endgame Gear / VAXEE / Nordic nRF ...）
   C. 罗技 HID++ 2.0（Feature 0x1000 / 0x1004 / 0x1001）
   D. 用户自定义协议（protocols_user.json，由界面上的“手动标定”生成）
   E. 监听 Input Report 里上报的电量字段
   F. 原始 Feature Report 全量转储（给人看的，配合手动标定）
+
+另外，DARKRIM 耳机和 3554:FA09 键盘各有独立的小协议模块
+（darkrim_proto.py / aula_proto.py），在 A 与 B 之间单独尝试。
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from typing import Callable, Optional
 
 import hid_win as hw
 import darkrim_proto as drp
+import aula_proto as ap
 from hid_win import HidDevice, HidError, HidInterface, HidP_Feature, HidP_Input
 
 USER_PROTOCOL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -153,6 +157,17 @@ BUILTIN_PROTOCOLS: list[ProtocolSpec] = [
         level_offset=9, wait_ms=90, scale=1, mode="feature",
         notes="请求 0x15 读取电量",
     ),
+    # ---- UGREEN 2.4G 无线鼠标（2B89:0043）----
+    # 厂商接口 0xFFB5，Report ID 0xB5，8 字节 Output Report。
+    # 请求 B5 01 00...，回复 B5 01 01 <电量> <配置字节...>。
+    ProtocolSpec(
+        name="UGREEN 2.4G 无线鼠标",
+        vid=0x2B89, usage_page=0xFFB5, report_id=0xB5,
+        payload=[0x01], length=8, level_offset=3,
+        wait_ms=120, scale=1, level_max=100, mode="output",
+        expect=((1, 0x01), (2, 0x01)), retries=3,
+        notes="电量在回复第 3 字节；第 2 字节 0x01 表示有效回复",
+    ),
 ]
 
 
@@ -276,6 +291,32 @@ def strategy_darkrim(iface: HidInterface) -> Optional[BatteryResult]:
         extra={"name": info.name, "dongle_fw": info.dongle_firmware,
                "headset_fw": info.headset_firmware, "address": info.address,
                "status_code": info.status_code, "tlvs": info.raw_tlvs},
+    )
+
+
+# --------------------------------------------------------------------------
+# 策略 A3：3554:FA09 2.4G 键盘（AULA / MARVO / iLovbee 同方案）的 0x13/0x4A 查询
+# --------------------------------------------------------------------------
+def strategy_aula_keyboard(iface: HidInterface) -> Optional[BatteryResult]:
+    if iface.vid != ap.VID or iface.usage_page != ap.USAGE_PAGE:
+        return None
+    info = ap.read_info(iface, timeout=0.45)
+    if not info.online:
+        return BatteryResult(ok=False, source="2.4G 键盘私有协议",
+                             detail=info.detail or "键盘没有回复")
+    if info.charging:
+        return BatteryResult(
+            ok=True, level=None, status="charging",
+            source="2.4G 键盘私有协议（Report 0x13 / 命令 0x4A）",
+            detail=info.detail, raw=info.raw,
+        )
+    if info.level is None:
+        return BatteryResult(ok=False, source="2.4G 键盘私有协议",
+                             detail=info.detail or "回复里没有电量", raw=info.raw)
+    return BatteryResult(
+        ok=True, level=info.level, raw_level=info.raw_level,
+        status="unknown", source="2.4G 键盘私有协议（Report 0x13 / 命令 0x4A）",
+        detail=info.detail, raw=info.raw,
     )
 
 
@@ -674,6 +715,7 @@ def read_battery(iface: HidInterface, listen_seconds: float = 3.0,
     steps = [
         ("标准 HID 电量字段", lambda: strategy_standard_battery_usage(iface)),
         ("DARKRIM 私有协议", lambda: strategy_darkrim(iface)),
+        ("2.4G 键盘私有协议", lambda: strategy_aula_keyboard(iface)),
         ("厂商协议", lambda: strategy_vendor_protocol(iface)),
         ("罗技 HID++", lambda: strategy_logitech_hidpp(iface)),
     ]

@@ -64,7 +64,7 @@ def render_rgba(text: str, size: int, color: tuple[int, int, int],
         i = (y * size + x) * 4
         return (px[i], px[i + 1], px[i + 2], px[i + 3])
 
-    # 底衬（耳机图标用，跟鼠标图标区分开）
+    # 底衬（键盘图标用，跟鼠标图标区分开）
     if plate:
         r = max(1, size // 8)
         for y in range(size):
@@ -211,9 +211,9 @@ if __name__ == "__main__":
     os.makedirs(out, exist_ok=True)
     for text, color, plate, name in (
         ("82", (93, 220, 138), False, "mouse82"),
-        ("70", (93, 220, 138), True, "headset70"),
+        ("70", (93, 220, 138), True, "keyboard70"),
         ("9", (255, 107, 107), False, "mouse9"),
-        ("100", (245, 196, 81), True, "headset100"),
+        ("100", (245, 196, 81), True, "keyboard100"),
         ("25", (245, 196, 81), False, "mouse25"),
     ):
         imgs = [(s, render_rgba(text, s, color, plate)) for s in SIZES]

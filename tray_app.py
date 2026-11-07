@@ -3,7 +3,8 @@
 
 界面约定
 --------
-* 通知区域两个图标：ATK 鼠标（纯数字）、DARKRIM 耳机（数字带深色底板）。
+* 通知区域默认只有一个鼠标电量图标（纯数字）；如果键盘也能读到电量，
+  会再出现一个带底板的键盘图标。读不到的设备不占位置。
   图标颜色随电量变化：绿 ≥60 / 黄 30-59 / 红 <30。
 * **右键图标 → 直接打开简洁界面**（界面里改设置：刷新间隔 / 开机自启 / 退出托盘）。
 * 左键图标 → 立刻刷新一次。
@@ -38,7 +39,8 @@ from typing import Optional
 
 import hid_win as hw
 import battery as bt
-import darkrim_proto as drp
+import ugreen_proto as ugp
+import aula_proto as ap
 import win_icon
 import tray_common as tc
 
@@ -62,7 +64,8 @@ MSG_TRAY_CALLBACK = WM_APP + 1
 MSG_REFRESH_DONE = WM_APP + 2
 
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
-NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x01, 0x02, 0x04
+NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_STATE = 0x01, 0x02, 0x04, 0x08
+NIS_HIDDEN = 0x01
 
 SW_RESTORE = 9
 
@@ -156,9 +159,12 @@ KERNEL32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL,
 
 TRAY_ICONS = [
     # (uID, key, 提示名, 是否带底板)
-    (1, "mouse", "ATK 鼠标", False),
-    (2, "headset", "DARKRIM 耳机", True),
+    (1, "mouse", "UGREEN 鼠标", False),
+    (2, "keyboard", "2.4G 键盘", True),
 ]
+
+# 鼠标是主设备，读不到时也保留图标并显示原因；键盘只有真正读到电量才出现。
+ALWAYS_SHOW = {"mouse"}
 
 
 # --------------------------------------------------------------------------
@@ -173,22 +179,30 @@ def _find_iface(vid: int, usage_page: int, output_len: int = 0):
 
 
 def read_mouse() -> tuple[Optional[int], str]:
+    """UGREEN 2.4G 鼠标；找不到时退回旧的 ATK / VXE 接收器。"""
+    info = ugp.read_info(retries=2)
+    if info.online:
+        if info.level is not None:
+            return info.level, ""
+        return None, info.detail or "没有电量"
+    # 兼容旧接收器
     iface = _find_iface(0x373B, 0xFF05, 64) or _find_iface(0x373B, 0xFF02)
     if iface is None:
-        return None, "没找到接收器"
+        return None, info.detail or "没找到鼠标接收器"
     try:
         res = bt.strategy_vendor_protocol(iface)
     except Exception as e:
         return None, f"读取失败：{e}"
     if res is None:
         return None, "没有可用的读取方式"
-    if res.ok:
+    if res.ok and res.level is not None:
         return res.level, ""
     return None, res.detail or "无回复（动一下鼠标）"
 
 
-def read_headset() -> tuple[Optional[int], str]:
-    return drp.read_battery_only(timeout=0.4)
+def read_keyboard() -> tuple[Optional[int], str]:
+    """3554:FA09 2.4G 键盘（AULA / MARVO / iLovbee 同方案）。"""
+    return ap.read_battery_only(timeout=0.4)
 
 
 # --------------------------------------------------------------------------
@@ -202,7 +216,7 @@ class TrayApp:
         self.wndproc_ref = None
         self.busy = False
         self.levels = {k: (None, "正在读取…") for _, k, _, _ in TRAY_ICONS}
-        self.icons_added = False
+        self.icons_added: set[int] = set()
         self.taskbar_created_msg = USER32.RegisterWindowMessageW("TaskbarCreated")
         self.msg_quit = USER32.RegisterWindowMessageW(tc.MSG_QUIT)
         self.msg_reload = USER32.RegisterWindowMessageW(tc.MSG_RELOAD)
@@ -234,8 +248,11 @@ class TrayApp:
         nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
         nid.hWnd = self.hwnd
         nid.uID = uID
-        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_STATE
         nid.uCallbackMessage = MSG_TRAY_CALLBACK
+        # 尽量让图标直接出现在通知区域，而不是被收进“^”溢出菜单
+        nid.dwState = 0
+        nid.dwStateMask = NIS_HIDDEN
         return nid
 
     def _apply_icon(self, action: int, uID: int, key: str, title: str,
@@ -248,25 +265,47 @@ class TrayApp:
                      if level is not None else f"{title}：{err or '未知'}")
         return bool(SHELL32.Shell_NotifyIconW(action, ctypes.byref(nid)))
 
+    def _should_show(self, key: str) -> bool:
+        """键盘没有读到电量时不占托盘位置；鼠标始终显示。"""
+        if key in ALWAYS_SHOW:
+            return True
+        return self.levels.get(key, (None, ""))[0] is not None
+
     def add_icons(self) -> None:
+        self.icons_added.clear()
         for uID, key, title, plate in TRAY_ICONS:
+            if not self._should_show(key):
+                continue
             ok = self._apply_icon(NIM_ADD, uID, key, title, plate)
+            if ok:
+                self.icons_added.add(uID)
             self.log(f"NIM_ADD {title} -> {'ok' if ok else '失败'}")
-        self.icons_added = True
 
     def update_icons(self) -> None:
-        if not self.icons_added:
-            self.add_icons()
-            return
         for uID, key, title, plate in TRAY_ICONS:
-            self._apply_icon(NIM_MODIFY, uID, key, title, plate)
+            show = self._should_show(key)
+            added = uID in self.icons_added
+            if show and not added:
+                if self._apply_icon(NIM_ADD, uID, key, title, plate):
+                    self.icons_added.add(uID)
+                    self.log(f"NIM_ADD {title}")
+            elif show and added:
+                self._apply_icon(NIM_MODIFY, uID, key, title, plate)
+            elif not show and added:
+                nid = self._nid(uID)
+                nid.uFlags = 0
+                SHELL32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
+                self.icons_added.discard(uID)
+                self.log(f"NIM_DELETE {title}（没有读到电量）")
 
     def remove_icons(self) -> None:
         for uID, _, _, _ in TRAY_ICONS:
+            if uID not in self.icons_added:
+                continue
             nid = self._nid(uID)
             nid.uFlags = 0
             SHELL32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
-        self.icons_added = False
+        self.icons_added.clear()
 
     # ---- 定时器 / 刷新 --------------------------------------------------
     def apply_timer(self) -> None:
@@ -304,15 +343,15 @@ class TrayApp:
     def _worker(self, hwnd: int) -> None:
         try:
             self.levels["mouse"] = read_mouse()
-            self.levels["headset"] = read_headset()
+            self.levels["keyboard"] = read_keyboard()
         except Exception:
             self.log("读取异常:\n" + traceback.format_exc())
         USER32.PostMessageW(hwnd, MSG_REFRESH_DONE, 0, 0)
 
     def on_refresh_done(self) -> None:
         self.busy = False
-        m, h = self.levels["mouse"], self.levels["headset"]
-        self.log(f"刷新完成：鼠标={m[0]}（{m[1] or 'ok'}） 耳机={h[0]}（{h[1] or 'ok'}）")
+        m, k = self.levels["mouse"], self.levels["keyboard"]
+        self.log(f"刷新完成：鼠标={m[0]}（{m[1] or 'ok'}） 键盘={k[0]}（{k[1] or 'ok'}）")
         self.update_icons()
 
     # ---- 打开简洁界面 ---------------------------------------------------
@@ -436,7 +475,7 @@ def main() -> int:
         if tc.is_tray_running():
             # 真有一个正常实例在跑：让它重读配置
             tc.post_to_tray(tc.MSG_RELOAD)
-            print("已经在运行了（托盘里两个数字图标就是它；右键图标打开界面）")
+            print("已经在运行了（托盘里的数字图标就是它；右键图标打开界面）")
             return 0
         # 有人占着锁但已经没有窗口 —— 上一版留下的僵尸进程，清掉后继续启动
         tc.cleanup_zombie()
